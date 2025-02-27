@@ -65,6 +65,8 @@ AVCaptureAudioDataOutputSampleBufferDelegate>
 @property(readonly, nonatomic) PhysicalButtonController *physicalButtonController;
 @property(readonly, copy) void (^completion)(NSNumber * _Nullable, FlutterError * _Nullable);
 @property(nonatomic, copy) void (^onPreviewFrameAvailable)(void);
+@property (nonatomic, strong) AVCaptureDeviceDiscoverySession *discoverySession;
+@property (nonatomic, strong) NSArray<AVCaptureDevice *> *availableCameraDevices;
 
 - (instancetype)initWithCameraSensor:(PigeonSensorPosition)sensor
                         videoOptions:(nullable CupertinoVideoOptions *)videoOptions
@@ -104,6 +106,7 @@ AVCaptureAudioDataOutputSampleBufferDelegate>
 - (CGSize)getEffectivPreviewSize;
 - (void)setUpCaptureSessionForAudioError:(nonnull void (^)(NSError *))error;
 - (void)setBrightness:(NSNumber *)brightness error:(FlutterError * _Nullable __autoreleasing * _Nonnull)error;
+- (void)switchLensBasedOnFocusDistance:(CGFloat)focusDistance;
 @end
 
 NS_ASSUME_NONNULL_END

@@ -12,7 +12,10 @@ An open source camera plugin by the community for the community
   s.homepage         = 'http://example.com'
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'Your Company' => 'email@example.com' }
-  s.source           = { :path => '.' }
+  s.source = {
+      :git => 'https://github.com/brancedev/CamerAwesome.git',
+      :branch => 'fastic_v1'
+  }
   s.source_files = 'Classes/**/*'
   s.dependency 'Flutter'
   s.platform = :ios, '8.0'
