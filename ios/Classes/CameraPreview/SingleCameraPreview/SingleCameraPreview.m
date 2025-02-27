@@ -668,6 +668,7 @@
 
 // Add method to switch lens based on focus distance
 - (void)switchLensBasedOnFocusDistance:(CGFloat)focusDistance {
+    NSLog(@"LENS_SWITCH: Focus distance: %f", focusDistance);
     if (_cameraSensorPosition == PigeonSensorPositionFront) return;
 
     // Find appropriate lens type based on focus distance
@@ -676,15 +677,20 @@
     // AVFoundation's lensPosition is normalized between 0 and 1
     // 0 means infinity focus, 1 means closest focus
     if (focusDistance > 0.8) {
+        NSLog(@"LENS_SWITCH: Suggesting ultra-wide for close distance");
         // Very close subject - try ultra wide
         preferredDeviceType = AVCaptureDeviceTypeBuiltInUltraWideCamera;
     } else if (focusDistance > 0.4) {
+        NSLog(@"LENS_SWITCH: Suggesting wide-angle for medium distance");
         // Medium distance - use wide angle
         preferredDeviceType = AVCaptureDeviceTypeBuiltInWideAngleCamera;
     } else {
+        NSLog(@"LENS_SWITCH: Suggesting telephoto for far distance");
         // Far subject - use telephoto if available
         preferredDeviceType = AVCaptureDeviceTypeBuiltInTelephotoCamera;
     }
+
+    NSLog(@"LENS_SWITCH: Current device type: %@", _captureDevice.deviceType);
 
     // Check if the current device is already of the preferred type
     if ([_captureDevice.deviceType isEqualToString:preferredDeviceType]) {
@@ -697,7 +703,7 @@
         if ([device position] == AVCaptureDevicePositionBack &&
             [device.deviceType isEqualToString:preferredDeviceType]) {
             newDevice = device;
-            break
+            break;
         }
     }
 
@@ -720,6 +726,7 @@
 
 // Add method to switch to a specific device
 - (void)switchToDevice:(AVCaptureDevice *)newDevice {
+    NSLog(@"LENS_SWITCH: Switching from %@ to %@", _captureDevice.deviceType, newDevice.deviceType);
     // Begin configuration
     [_captureSession beginConfiguration];
 
@@ -758,8 +765,12 @@
         }
     }
 
+    [self observeFocusChanges];
+
     // Commit configuration
     [_captureSession commitConfiguration];
+
+    NSLog(@"LENS_SWITCH: Lens switch complete");
 }
 
 // Method to get available lens types for the current position

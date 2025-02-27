@@ -24,7 +24,7 @@ class AwesomeFilterSelector extends StatefulWidget {
 }
 
 class _AwesomeFilterSelectorState extends State<AwesomeFilterSelector> {
-  final CarouselSliderController _controller = CarouselSliderController();
+  final CarouselController _controller = CarouselController();
   int? _textureId;
   int _selected = 0;
 
