@@ -9,6 +9,12 @@
 
 @implementation SingleCameraPreview {
     dispatch_queue_t _dispatchQueue;
+    CGFloat _lastFocusDistance;
+    NSDate *_lastLensSwitchTime;
+    int _stableFocusReadingsCount;
+    CGFloat _focusDistanceSum;
+    NSTimer *_focusEvaluationTimer;
+    BOOL _isLensSwitchInProgress;
 }
 
 - (instancetype)initWithCameraSensor:(PigeonSensorPosition)sensor
@@ -173,6 +179,7 @@
 
 - (void)dealloc {
     [self.motionController startMotionDetection];
+    [self stopFocusEvaluationTimer];
     // NEW: Remove observer when deallocating
     [self removeFocusObserver];
 }
@@ -623,14 +630,6 @@
 
 #pragma mark - NEW METHODS FOR LENS SWITCHING
 
-// Add setup for auto lens switching
-- (void)setupAutoLensSwitching {
-    // Only set up if we have multiple cameras and it's the back camera
-    if (_availableCameraDevices.count > 1 && _cameraSensorPosition == PigeonSensorPositionBack) {
-        [self observeFocusChanges];
-    }
-}
-
 // Add method to observe focus changes
 - (void)observeFocusChanges {
     // Remove any existing observer first
@@ -655,6 +654,7 @@
     [[NSNotificationCenter defaultCenter] removeObserver:self
                                                     name:AVCaptureDeviceSubjectAreaDidChangeNotification
                                                   object:_captureDevice];
+    [self stopFocusEvaluationTimer];
 }
 
 // Add method to handle subject area changes
@@ -666,69 +666,112 @@
     });
 }
 
-// Add method to switch lens based on focus distance
 - (void)switchLensBasedOnFocusDistance:(CGFloat)focusDistance {
-    NSLog(@"LENS_SWITCH: Focus distance: %f", focusDistance);
-    if (_cameraSensorPosition == PigeonSensorPositionFront) return;
+    // Ignore if front camera or lens switch is already in progress
+    if (_cameraSensorPosition == PigeonSensorPositionFront || _isLensSwitchInProgress) return;
 
-    // Find appropriate lens type based on focus distance
-    AVCaptureDeviceType preferredDeviceType;
-
-    // AVFoundation's lensPosition is normalized between 0 and 1
-    // 0 means infinity focus, 1 means closest focus
-    if (focusDistance > 0.8) {
-        NSLog(@"LENS_SWITCH: Suggesting ultra-wide for close distance");
-        // Very close subject - try ultra wide
-        preferredDeviceType = AVCaptureDeviceTypeBuiltInUltraWideCamera;
-    } else if (focusDistance > 0.4) {
-        NSLog(@"LENS_SWITCH: Suggesting wide-angle for medium distance");
-        // Medium distance - use wide angle
-        preferredDeviceType = AVCaptureDeviceTypeBuiltInWideAngleCamera;
-    } else {
-        NSLog(@"LENS_SWITCH: Suggesting telephoto for far distance");
-        // Far subject - use telephoto if available
-        preferredDeviceType = AVCaptureDeviceTypeBuiltInTelephotoCamera;
+    // Initialize lens switch time if needed
+    if (_lastLensSwitchTime == nil) {
+        _lastLensSwitchTime = [NSDate dateWithTimeIntervalSince1970:0]; // Set to epoch
+        _lastFocusDistance = focusDistance;
+        _stableFocusReadingsCount = 0;
+        _focusDistanceSum = 0;
     }
 
-    NSLog(@"LENS_SWITCH: Current device type: %@", _captureDevice.deviceType);
+    // Calculate time since last lens switch
+    NSTimeInterval timeSinceLastSwitch = [[NSDate date] timeIntervalSinceDate:_lastLensSwitchTime];
 
-    // Check if the current device is already of the preferred type
-    if ([_captureDevice.deviceType isEqualToString:preferredDeviceType]) {
+    // Don't allow lens switches more frequently than every 2 seconds
+    if (timeSinceLastSwitch < 2.0) {
         return;
     }
 
-    // Find a device of the preferred type
-    AVCaptureDevice *newDevice = nil;
-    for (AVCaptureDevice *device in _availableCameraDevices) {
-        if ([device position] == AVCaptureDevicePositionBack &&
-            [device.deviceType isEqualToString:preferredDeviceType]) {
-            newDevice = device;
-            break;
-        }
+    // Calculate focus distance change
+    CGFloat focusDistanceChange = fabs(focusDistance - _lastFocusDistance);
+
+    // If focus distance changed significantly, reset stability counter
+    if (focusDistanceChange > 0.15) {
+        _stableFocusReadingsCount = 0;
+        _focusDistanceSum = 0;
+    } else {
+        // Otherwise, accumulate stable readings
+        _stableFocusReadingsCount++;
+        _focusDistanceSum += focusDistance;
     }
 
-    // If preferred device not found, fallback to wide angle
-    if (!newDevice && ![preferredDeviceType isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera]) {
-        for (AVCaptureDevice *device in _availableCameraDevices) {
-            if ([device position] == AVCaptureDevicePositionBack &&
-                [device.deviceType isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera]) {
-                newDevice = device;
-                break;
+    // Only switch lenses if we have enough stable readings (3 in this case)
+    if (_stableFocusReadingsCount >= 3) {
+        // Calculate average focus distance over stable period
+        CGFloat avgFocusDistance = _focusDistanceSum / _stableFocusReadingsCount;
+
+        // Determine appropriate lens type based on average focus distance
+        AVCaptureDeviceType preferredDeviceType;
+
+        // More gradual thresholds with hysteresis
+        if (avgFocusDistance > 0.85) {
+            NSLog(@"LENS_SWITCH: Suggesting ultra-wide for close distance (avg: %f)", avgFocusDistance);
+            preferredDeviceType = AVCaptureDeviceTypeBuiltInUltraWideCamera;
+        } else if (avgFocusDistance > 0.7) {
+            // Hysteresis zone - don't switch
+            return;
+        } else if (avgFocusDistance > 0.45) {
+            NSLog(@"LENS_SWITCH: Suggesting wide-angle for medium distance (avg: %f)", avgFocusDistance);
+            preferredDeviceType = AVCaptureDeviceTypeBuiltInWideAngleCamera;
+        } else if (avgFocusDistance > 0.3) {
+            // Hysteresis zone - don't switch
+            return;
+        } else {
+            NSLog(@"LENS_SWITCH: Suggesting telephoto for far distance (avg: %f)", avgFocusDistance);
+            preferredDeviceType = AVCaptureDeviceTypeBuiltInTelephotoCamera;
+        }
+
+        // Check if device supports the preferred type
+        if (![self isDeviceTypeAvailable:preferredDeviceType]) {
+            // Fall back to wide angle if preferred type not available
+            if (![preferredDeviceType isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera] &&
+                [self isDeviceTypeAvailable:AVCaptureDeviceTypeBuiltInWideAngleCamera]) {
+                preferredDeviceType = AVCaptureDeviceTypeBuiltInWideAngleCamera;
+            } else {
+                return; // Can't switch if no suitable device available
             }
         }
+
+        // Check if the current device is already of the preferred type
+        if ([_captureDevice.deviceType isEqualToString:preferredDeviceType]) {
+            return;
+        }
+
+        // Find a device of the preferred type
+        AVCaptureDevice *newDevice = [self findDeviceWithType:preferredDeviceType];
+
+        // If we found a new device, switch to it
+        if (newDevice) {
+            [self switchToDevice:newDevice];
+
+            // Reset counters after switching
+            _lastLensSwitchTime = [NSDate date];
+            _stableFocusReadingsCount = 0;
+            _focusDistanceSum = 0;
+        }
     }
 
-    // If we found a new device, switch to it
-    if (newDevice) {
-        [self switchToDevice:newDevice];
-    }
+    // Update last focus distance
+    _lastFocusDistance = focusDistance;
 }
 
 // Add method to switch to a specific device
 - (void)switchToDevice:(AVCaptureDevice *)newDevice {
     NSLog(@"LENS_SWITCH: Switching from %@ to %@", _captureDevice.deviceType, newDevice.deviceType);
+
+    // Set flag to prevent concurrent lens switches
+    _isLensSwitchInProgress = YES;
+
     // Begin configuration
     [_captureSession beginConfiguration];
+
+    // Store current focus mode and point of interest
+    AVCaptureFocusMode previousFocusMode = _captureDevice.focusMode;
+    CGPoint previousFocusPoint = _captureDevice.focusPointOfInterest;
 
     // Remove current input
     [_captureSession removeInput:_captureVideoInput];
@@ -739,6 +782,7 @@
     if (error) {
         NSLog(@"Error creating device input: %@", error.localizedDescription);
         [_captureSession commitConfiguration];
+        _isLensSwitchInProgress = NO;
         return;
     }
 
@@ -763,6 +807,19 @@
             // Restore orientation
             [_captureConnection setVideoOrientation:AVCaptureVideoOrientationPortrait];
         }
+
+        // Transfer focus settings to new device if supported
+        if ([_captureDevice lockForConfiguration:&error]) {
+            if ([_captureDevice isFocusModeSupported:previousFocusMode]) {
+                [_captureDevice setFocusMode:previousFocusMode];
+            }
+
+            if ([_captureDevice isFocusPointOfInterestSupported]) {
+                [_captureDevice setFocusPointOfInterest:previousFocusPoint];
+            }
+
+            [_captureDevice unlockForConfiguration];
+        }
     }
 
     [self observeFocusChanges];
@@ -771,7 +828,77 @@
     [_captureSession commitConfiguration];
 
     NSLog(@"LENS_SWITCH: Lens switch complete");
+
+    // Reset lens switch flag after a short delay to ensure stability
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        self->_isLensSwitchInProgress = NO;
+    });
 }
+
+- (BOOL)isDeviceTypeAvailable:(AVCaptureDeviceType)deviceType {
+    for (AVCaptureDevice *device in _availableCameraDevices) {
+        if ([device position] == AVCaptureDevicePositionBack &&
+            [device.deviceType isEqualToString:deviceType]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Add helper method to find device with specific type
+- (AVCaptureDevice *)findDeviceWithType:(AVCaptureDeviceType)deviceType {
+    for (AVCaptureDevice *device in _availableCameraDevices) {
+        if ([device position] == AVCaptureDevicePositionBack &&
+            [device.deviceType isEqualToString:deviceType]) {
+            return device;
+        }
+    }
+    return nil;
+}
+
+- (void)setupAutoLensSwitching {
+    // Reset properties
+    _lastFocusDistance = 0;
+    _lastLensSwitchTime = nil;
+    _stableFocusReadingsCount = 0;
+    _focusDistanceSum = 0;
+    _isLensSwitchInProgress = NO;
+
+    // Only set up if we have multiple cameras and it's the back camera
+    if (_availableCameraDevices.count > 1 && _cameraSensorPosition == PigeonSensorPositionBack) {
+        [self observeFocusChanges];
+
+        // Set up timer for periodic focus evaluation
+        [self startFocusEvaluationTimer];
+    }
+}
+
+// Add methods for periodic focus evaluation
+- (void)startFocusEvaluationTimer {
+    // Invalidate existing timer if any
+    [self stopFocusEvaluationTimer];
+
+    // Create new timer that fires every 0.5 seconds
+    _focusEvaluationTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                             target:self
+                                                           selector:@selector(evaluateFocusForLensSwitch)
+                                                           userInfo:nil
+                                                            repeats:YES];
+}
+
+- (void)stopFocusEvaluationTimer {
+    if (_focusEvaluationTimer) {
+        [_focusEvaluationTimer invalidate];
+        _focusEvaluationTimer = nil;
+    }
+}
+
+- (void)evaluateFocusForLensSwitch {
+    // Get current focus distance and check if we should switch lenses
+    CGFloat focusDistance = _captureDevice.lensPosition;
+    [self switchLensBasedOnFocusDistance:focusDistance];
+}
+
 
 // Method to get available lens types for the current position
 - (NSArray<NSString *> *)getAvailableLensTypes {
